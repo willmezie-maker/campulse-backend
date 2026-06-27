@@ -11,6 +11,14 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 )
 
+// Service client — bypasses RLS, used only for trusted backend
+// operations like creating workspaces on a user's behalf
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+)
+console.log('Service key loaded:', process.env.SUPABASE_SERVICE_KEY ? 'YES, starts with ' + process.env.SUPABASE_SERVICE_KEY.slice(0, 15) : 'MISSING')
+app.use(cors())
 app.use(express.json())
 
 app.get('/', (req, res) => {
@@ -25,6 +33,100 @@ app.get('/cameras', async (req, res) => {
   }
 
   res.json({ cameras: data })
+})
+
+// Sign up a new user
+app.post('/auth/signup', async (req, res) => {
+  const { email, password, name, role } = req.body
+
+  const { data: authData, error: authError } = await supabase.auth.signUp({
+    email,
+    password
+  })
+
+  if (authError) {
+    return res.status(400).json({ error: authError.message })
+  }
+
+  const { data: profile, error: profileError } = await supabase
+    .from('profiles')
+    .insert({ id: authData.user.id, name, role: role || 'technician' })
+    .select()
+    .single()
+
+  if (profileError) {
+    return res.status(400).json({ error: profileError.message })
+  }
+
+  res.json({ message: 'Account created', user: profile })
+})
+
+// Log in an existing user
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body
+
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password
+  })
+
+  if (error) {
+    return res.status(400).json({ error: error.message })
+  }
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', data.user.id)
+    .single()
+
+  res.json({
+    message: 'Login successful',
+    token: data.session.access_token,
+    user: profile
+  })
+})
+
+// Create a new workspace (a CCTV company account)
+app.post('/workspaces', async (req, res) => {
+  const { name, ownerId } = req.body
+
+  const { data: workspace, error: workspaceError } = await supabaseAdmin
+    .from('workspaces')
+    .insert({ name, owner_id: ownerId })
+    .select()
+    .single()
+
+  if (workspaceError) {
+    return res.status(400).json({ error: workspaceError.message })
+  }
+
+  const { error: linkError } = await supabaseAdmin
+    .from('workspace_users')
+    .insert({ workspace_id: workspace.id, user_id: ownerId, role: 'owner' })
+
+  if (linkError) {
+    return res.status(400).json({ error: linkError.message })
+  }
+
+  res.json({ workspace })
+})
+
+// Create a new site within a workspace
+app.post('/sites', async (req, res) => {
+  const { name, address, workspaceId } = req.body
+
+  const { data, error } = await supabaseAdmin
+    .from('sites')
+    .insert({ name, address, workspace_id: workspaceId })
+    .select()
+    .single()
+
+  if (error) {
+    return res.status(400).json({ error: error.message })
+  }
+
+  res.json({ site: data })
 })
 
 app.listen(PORT, () => {
