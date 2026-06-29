@@ -129,6 +129,111 @@ app.post('/sites', async (req, res) => {
   res.json({ site: data })
 })
 
+const ping = require('ping')
+
+async function pingAllCameras() {
+  const { data: cameras, error } = await supabase.from('cameras').select('*')
+
+  if (error) {
+    console.error('Error fetching cameras:', error.message)
+    return
+  }
+
+  if (!cameras || cameras.length === 0) {
+    console.log('No cameras to ping yet')
+    return
+  }
+
+  for (const camera of cameras) {
+    const result = await ping.promise.probe(camera.ip_address, { timeout: 5 })
+    const isOnline = result.alive
+
+    console.log(`${camera.name} (${camera.ip_address}): ${isOnline ? 'ONLINE' : 'OFFLINE'}`)
+
+    if (camera.status !== (isOnline ? 'online' : 'offline')) {
+  await supabaseAdmin
+    .from('cameras')
+    .update({ status: isOnline ? 'online' : 'offline' })
+    .eq('id', camera.id)
+
+  console.log(`Status changed for ${camera.name} → ${isOnline ? 'online' : 'offline'}`)
+
+  if (!isOnline) {
+    // Camera just went offline — create a fault record
+    const { error: faultError } = await supabaseAdmin
+      .from('faults')
+      .insert({
+        camera_id: camera.id,
+        offline_since: new Date()
+      })
+
+    if (faultError) {
+      console.error('Error creating fault:', faultError.message)
+    } else {
+      console.log(`Fault created for ${camera.name}`)
+    }
+  } else {
+    // Camera just came back online — close the open fault
+    const { data: openFault } = await supabaseAdmin
+      .from('faults')
+      .select('*')
+      .eq('camera_id', camera.id)
+      .is('resolved_at', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single()
+
+    if (openFault) {
+      const offlineSince = new Date(openFault.offline_since)
+      const resolvedAt = new Date()
+      const downtimeMinutes = Math.round((resolvedAt - offlineSince) / 1000 / 60)
+
+      await supabaseAdmin
+        .from('faults')
+        .update({
+          resolved_at: resolvedAt,
+          downtime_minutes: downtimeMinutes
+        })
+        .eq('id', openFault.id)
+
+      console.log(`Fault resolved for ${camera.name} — downtime: ${downtimeMinutes} min`)
+    }
+  }
+}
+  }
+}
+
+setInterval(pingAllCameras, 30000)
+pingAllCameras()
+
 app.listen(PORT, () => {
   console.log(`CamPulse backend running on port ${PORT}`)
+})
+
+// GET routes
+app.get('/workspaces', async (req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('workspaces')
+    .select('*')
+
+  if (error) return res.status(400).json({ error: error.message })
+  res.json(data)
+})
+
+app.get('/sites', async (req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('sites')
+    .select('*')
+
+  if (error) return res.status(400).json({ error: error.message })
+  res.json(data)
+})
+
+app.get('/cameras', async (req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('cameras')
+    .select('*')
+
+  if (error) return res.status(400).json({ error: error.message })
+  res.json(data)
 })
