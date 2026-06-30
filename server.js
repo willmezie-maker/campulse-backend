@@ -131,6 +131,41 @@ app.post('/sites', async (req, res) => {
 
 const ping = require('ping')
 
+function diagnoseFault(camera, siblingCameras, recentFaultCount) {
+  const offlineSiblings = siblingCameras.filter(c => c.id !== camera.id && c.status === 'offline')
+  const totalSiblings = siblingCameras.filter(c => c.id !== camera.id)
+
+  // Rule 1: Multiple cameras at same site offline together = power outage
+  if (totalSiblings.length > 0 && offlineSiblings.length / totalSiblings.length >= 0.5) {
+    return {
+      probable_cause: 'Power outage (site-wide)',
+      confidence: 85
+    }
+  }
+
+  // Rule 2: This camera has flapped on/off multiple times recently = hardware issue
+  if (recentFaultCount >= 3) {
+    return {
+      probable_cause: 'Camera hardware issue (intermittent failures)',
+      confidence: 70
+    }
+  }
+
+  // Rule 3: Single camera, clean offline = cable/connection fault
+  if (totalSiblings.length > 0 && offlineSiblings.length === 0) {
+    return {
+      probable_cause: 'Faulty cable or connection',
+      confidence: 65
+    }
+  }
+
+  // Fallback: not enough data to be confident
+  return {
+    probable_cause: 'Unknown - insufficient data',
+    confidence: 30
+  }
+}
+
 async function pingAllCameras() {
   const { data: cameras, error } = await supabase.from('cameras').select('*')
 
@@ -160,17 +195,33 @@ async function pingAllCameras() {
 
   if (!isOnline) {
     // Camera just went offline — create a fault record
-    const { error: faultError } = await supabaseAdmin
-      .from('faults')
-      .insert({
-        camera_id: camera.id,
-        offline_since: new Date()
-      })
+   // Camera just went offline — diagnose and create a fault record
+const { data: siblingCameras } = await supabaseAdmin
+  .from('cameras')
+  .select('id, status')
+  .eq('site_id', camera.site_id)
+
+const { count: recentFaultCount } = await supabaseAdmin
+  .from('faults')
+  .select('*', { count: 'exact', head: true })
+  .eq('camera_id', camera.id)
+  .gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+
+const diagnosis = diagnoseFault(camera, siblingCameras || [], recentFaultCount || 0)
+
+const { error: faultError } = await supabaseAdmin
+  .from('faults')
+  .insert({
+    camera_id: camera.id,
+    offline_since: new Date(),
+    probable_cause: diagnosis.probable_cause,
+    confidence: diagnosis.confidence
+  })
 
     if (faultError) {
       console.error('Error creating fault:', faultError.message)
     } else {
-      console.log(`Fault created for ${camera.name}`)
+      console.log(`Fault created for ${camera.name} — Cause: ${diagnosis.probable_cause} (${diagnosis.confidence}% confidence)`)
     }
   } else {
     // Camera just came back online — close the open fault
@@ -196,7 +247,7 @@ async function pingAllCameras() {
         })
         .eq('id', openFault.id)
 
-      console.log(`Fault resolved for ${camera.name} — downtime: ${downtimeMinutes} min`)
+     console.log(`Fault resolved for ${camera.name} — downtime: ${downtimeMinutes} min`)
     }
   }
 }
